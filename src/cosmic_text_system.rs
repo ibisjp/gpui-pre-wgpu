@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-17): a face added by `add_fonts` is loaded without an 'm' glyph (the system's fonts are checked as before).
 // Modified by ibis inc. for ibisOffice (2026-10-14): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-18): the system's locale is given to cosmic-text as the language alone
 // (`ja-JP` → `ja`), so that kanji not in a font are drawn in the Japanese font, not the Simplified Chinese one.
@@ -65,6 +66,9 @@ struct CosmicTextSystemState {
     /// Font files copied for `font_data`, by the address of the data the
     /// font database holds (one copy for all the faces of a collection).
     font_files: HashMap<usize, Arc<Vec<u8>>>,
+    /// The faces `add_fonts` gave (the application's own fonts, as against the system's): they are loaded without an 'm' glyph too
+    /// (modified by ibis inc.; see `load_family`).
+    added_faces: collections::HashSet<cosmic_text::fontdb::ID>,
 }
 
 /// Serif (mincho) or sans (gothic) design of a face. A request for one class must never fall back to a face of the other
@@ -212,6 +216,7 @@ impl CosmicTextSystem {
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
             font_files: HashMap::default(),
+            added_faces: Default::default(),
         }))
     }
 
@@ -232,6 +237,7 @@ impl CosmicTextSystem {
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
             font_files: HashMap::default(),
+            added_faces: Default::default(),
         }))
     }
 }
@@ -442,7 +448,8 @@ impl CosmicTextSystemState {
         self.font_ids_by_family_cache.clear();
         let db = self.font_system.db_mut();
         for bytes in fonts {
-            db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            let ids = db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            self.added_faces.extend(ids);
         }
         Ok(())
     }
@@ -530,8 +537,14 @@ impl CosmicTextSystemState {
                 "Segoe Fluent Icons",
             ];
 
+            // Modified by ibis inc.: a face that was added by `add_fonts` (the application's own fonts, the setup's downloads and the
+            // subsets of them) is kept without an 'm' too. A font of the Digital Agency (Add Character_GJMincho) and the blocks a font is
+            // cut into (the characters of a range of Unicode) have no Latin letters, and with this check the family was "not found"
+            // (#157, #158). Text laid out with them still falls to the next font of the chain for the characters they lack. The system's
+            // fonts are checked as before.
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !self.added_faces.contains(&database_id)
             {
                 self.font_system.db_mut().remove_face(font.id());
                 continue;
