@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-23): `new_headless` also takes Metal (the wgpu renderer's test on the Mac).
 // Modified by ibis inc. for ibisOffice (2026-10-14): added `WgpuContext::new_headless` (a device without a window).
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
@@ -151,7 +152,7 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new_headless() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL | wgpu::Backends::METAL,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
