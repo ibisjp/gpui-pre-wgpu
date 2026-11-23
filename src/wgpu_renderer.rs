@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-23): `read_back_pass` (the pixels of an offscreen pass for `Window::read_back_offscreen`).
 // Modified by ibis inc. for ibisOffice (2026-11-08): offscreen passes and textured quads (a texture drawn through a 4x4 transform), on the storage-buffer and the WebGL2 paths alike.
 // Modified by ibis inc. for ibisOffice (2026-10-14): a renderer can draw into a texture instead of a window's surface; added `WgpuHeadlessRenderer` (drawing scenes into images without a window).
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
@@ -252,8 +253,7 @@ struct WgpuResources {
 }
 
 struct OffscreenTexture {
-    /// Kept so that the view's texture lives as long as the entry.
-    #[allow(dead_code)]
+    /// Kept so that the view's texture lives as long as the entry (and copied from, for `Window::read_back_offscreen`).
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     /// The size the texture was made at (the surface's).
@@ -1676,7 +1676,9 @@ impl WgpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1690,6 +1692,96 @@ impl WgpuRenderer {
             },
         );
         view
+    }
+
+    /// Copy the top left `content` pixels of the offscreen pass `id`'s texture into a buffer and give them to `readback` when the device
+    /// has finished (`Window::read_back_offscreen`): straight RGBA. It does not wait in the browser (the buffer's mapping finishes on a
+    /// later turn of the event loop); elsewhere it waits for the device, since a caller has no event loop to poll it from.
+    fn read_back_pass(&self, id: u32, content: (u32, u32), readback: &gpui::OffscreenReadbackSender) {
+        if !readback.claim() {
+            return;
+        }
+        let resources = self.resources();
+        let Some(pass) = resources.offscreen_passes.get(&id) else {
+            readback.complete(None);
+            return;
+        };
+        let (width, height) = (content.0.max(1), content.1.max(1));
+        let bytes_per_row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = Arc::new(resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen_pass_read_back"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        let mut encoder = resources
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("offscreen_pass_read_back"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &pass.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        resources.queue.submit(Some(encoder.finish()));
+        let bgra = matches!(
+            pass.texture.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let sender = readback.clone();
+        let mapped_buffer = buffer.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_err() {
+                    sender.complete(None);
+                    return;
+                }
+                let mapped = mapped_buffer.slice(..).get_mapped_range();
+                let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+                for row in mapped.chunks(bytes_per_row as usize).take(height as usize) {
+                    for px in row[..(width * 4) as usize].chunks_exact(4) {
+                        let (r, g, b) = if bgra { (px[2], px[1], px[0]) } else { (px[0], px[1], px[2]) };
+                        // The pass's texture holds premultiplied colors.
+                        let a = px[3];
+                        let un = |c: u8| -> u8 {
+                            if a == 0 || a == 255 {
+                                if a == 0 { 0 } else { c }
+                            } else {
+                                ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
+                            }
+                        };
+                        rgba.extend_from_slice(&[un(r), un(g), un(b), a]);
+                    }
+                }
+                drop(mapped);
+                mapped_buffer.unmap();
+                sender.complete(Some(gpui::OffscreenPixels { width, height, rgba }));
+            });
+        #[cfg(not(target_family = "wasm"))]
+        let _ = resources.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        #[cfg(target_family = "wasm")]
+        let _ = resources.device.poll(wgpu::PollType::Poll);
     }
 
     /// Draw the offscreen passes of `scene` (each to its texture, before the scene itself), then the scene.
@@ -1706,6 +1798,9 @@ impl WgpuRenderer {
             let view = self.offscreen_pass_view(pass.id.0, content);
             used.push(pass.id.0);
             self.record_scene(&pass.scene, &view)?;
+            if let Some(readback) = pass.readback.as_ref().filter(|r| !r.is_complete()) {
+                self.read_back_pass(pass.id.0, content, readback);
+            }
         }
         self.resources_mut()
             .offscreen_passes
