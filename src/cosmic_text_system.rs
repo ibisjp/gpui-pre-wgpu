@@ -1333,8 +1333,9 @@ fn is_colour_font(font: &swash::FontRef<'_>) -> bool {
 }
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
-    // TODO: Include other common emoji fonts
-    postscript_name == "NotoColorEmoji"
+    // Modified by ibis inc. (ibisOffice K0066): Apple Color Emoji (sbix) and Segoe UI Emoji (COLR) too. Only "NotoColorEmoji" was known, so a glyph of the
+    // others was rasterised without the colour sources (`render_glyph_image`) and an emoji was not drawn on iOS.
+    matches!(postscript_name, "NotoColorEmoji" | "AppleColorEmoji" | "SegoeUIEmoji")
 }
 
 #[cfg(test)]
