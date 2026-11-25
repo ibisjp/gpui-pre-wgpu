@@ -243,6 +243,13 @@ impl CosmicTextSystem {
     }
 }
 
+impl CosmicTextSystem {
+    /// Adds the font file at `path` without reading it into memory (the file is mapped; modified by ibis inc., ibisOffice K0066).
+    pub fn add_font_file(&self, path: &std::path::Path) -> Result<()> {
+        self.0.write().add_font_file(path)
+    }
+}
+
 impl PlatformTextSystem for CosmicTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
@@ -442,6 +449,18 @@ impl CosmicTextSystemState {
                 self.font_system.get_font_matches(&fallback_attributes);
             }
         }
+    }
+
+    /// A font file added by its path, mapped into memory and not read (modified by ibis inc., ibisOffice K0066: iOS's Apple Color Emoji is 139 MB, which
+    /// `add_fonts` would hold all in memory).
+    fn add_font_file(&mut self, path: &std::path::Path) -> Result<()> {
+        self.font_ids_by_family_cache.clear();
+        let db = self.font_system.db_mut();
+        let before: collections::HashSet<cosmic_text::fontdb::ID> = db.faces().map(|face| face.id).collect();
+        db.load_font_file(path)?;
+        let added: Vec<cosmic_text::fontdb::ID> = db.faces().map(|face| face.id).filter(|id| !before.contains(id)).collect();
+        self.added_faces.extend(added);
+        Ok(())
     }
 
     #[profiling::function]
