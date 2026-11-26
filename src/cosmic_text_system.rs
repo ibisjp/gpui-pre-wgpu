@@ -660,6 +660,16 @@ impl CosmicTextSystemState {
         let font_ref = loaded_font.font.as_swash();
         let pixel_size = f32::from(params.font_size);
 
+        // Modified by ibis inc. (ibisOffice, iOS emoji): the Apple Color Emoji of an iPhone has its pictures in the 'emjc' form of sbix (Apple's own
+        // compression), which swash cannot read (it reads 'png ' only), so an emoji fell to its outline: a plain mask. CoreText draws it.
+        #[cfg(target_os = "ios")]
+        if params.is_emoji {
+            let postscript_name = self.font_system.db().face(loaded_font.font.id()).map(|face| face.post_script_name.clone());
+            if let Some(image) = postscript_name.and_then(|name| coretext_emoji_image(&name, params.glyph_id.0 as u16, pixel_size * params.scale_factor)) {
+                return Ok(image);
+            }
+        }
+
         let subpixel_offset = Vector::new(
             params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
             params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
@@ -1347,6 +1357,30 @@ fn face_info_into_properties(
 }
 
 /// Whether the face has colour glyphs: `CBDT` (Noto Color Emoji), `COLR` (Segoe UI Emoji), `sbix` (Apple Color Emoji) or `SVG ` (an OpenType-SVG font).
+/// A colour emoji glyph drawn by CoreText into an RGBA bitmap (`ibis_ios_raster_glyph` of `apps/ios/main.m`), in the form swash gives a colour bitmap:
+/// not premultiplied RGBA, `placement.left` to the right of the origin and `placement.top` above the baseline. `None` when CoreText has nothing to
+/// draw (the caller goes on with swash). Modified by ibis inc.
+#[cfg(target_os = "ios")]
+fn coretext_emoji_image(postscript_name: &str, glyph_id: u16, pixel_size: f32) -> Option<swash::scale::image::Image> {
+    unsafe extern "C" {
+        fn ibis_ios_raster_glyph(name: *const std::ffi::c_char, glyph: u16, px: f32, left: *mut i32, top: *mut i32, width: *mut u32, height: *mut u32) -> *mut u8;
+        fn ibis_ios_free_bytes(bytes: *mut u8);
+    }
+    let name = std::ffi::CString::new(postscript_name).ok()?;
+    let (mut left, mut top, mut width, mut height) = (0i32, 0i32, 0u32, 0u32);
+    let bytes = unsafe { ibis_ios_raster_glyph(name.as_ptr(), glyph_id, pixel_size, &mut left, &mut top, &mut width, &mut height) };
+    if bytes.is_null() || width == 0 || height == 0 {
+        return None;
+    }
+    let data = unsafe { std::slice::from_raw_parts(bytes, width as usize * height as usize * 4) }.to_vec();
+    unsafe { ibis_ios_free_bytes(bytes) };
+    let mut image = swash::scale::image::Image::new();
+    image.content = swash::scale::image::Content::Color;
+    image.placement = swash::zeno::Placement { left, top, width, height };
+    image.data = data;
+    Some(image)
+}
+
 fn is_colour_font(font: &swash::FontRef<'_>) -> bool {
     [b"CBDT", b"COLR", b"sbix", b"SVG "].iter().any(|tag| font.table(swash::tag_from_bytes(tag)).is_some())
 }
